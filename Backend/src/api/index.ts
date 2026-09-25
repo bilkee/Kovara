@@ -65,6 +65,8 @@ import { createProfilesRouter } from "./routes/profiles";
 import { createPostsRouter } from "./routes/posts";
 import { createFollowsRouter } from "./routes/follows";
 import { createPoolsRouter } from "./routes/pools";
+import { createIndexRouter } from "../analytics/routes";
+import { PostgresAnalyticsStore } from "../analytics/store";
 import { createModerationRouter } from "./routes/moderation";
 import { ModerationStore } from "../verification/moderation";
 
@@ -108,6 +110,18 @@ export interface AppOptions {
    * deployments are unaffected.
    */
   authMiddleware?: AuthMiddleware;
+
+  /**
+   * #654/#655: Analytics store backing the historical index series, the country
+   * leaderboard, and the filter-decision log.
+   *
+   * Supplied by the caller rather than constructed from `db` because these
+   * endpoints issue analytical SQL (windowing, ranking, partial indexes) that the
+   * `Database` repository interface has no reason to expose. When it is
+   * omitted, `/index` is not mounted and every other route behaves exactly as
+   * before, so existing deployments and tests need no change.
+   */
+  analyticsStore?: PostgresAnalyticsStore;
 }
 
 // ── Runtime configuration (all values are env-overridable) ─────────────────
@@ -257,6 +271,12 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
 // Conditionally mount experimental routes
   if (process.env.EXPERIMENTAL_FEATURES === "true") {
     apiRouter.use("/pools", createPoolsRouter(db));
+  }
+
+  // #654/#655: historical index series, country leaderboards, and the filter
+  // decision log. Mounted only when a store is supplied — see AppOptions.
+  if (options.analyticsStore) {
+    apiRouter.use("/index", createIndexRouter(options.analyticsStore));
   }
 
   interface SearchQuery {

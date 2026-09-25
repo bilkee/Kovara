@@ -48,6 +48,8 @@ import { runMigrations } from "./migrate";
 import { PostgresDatabase } from "./db";
 import { EventStore } from "./event-store";
 import { withRetry } from "./retry";
+import { runDailyIndexAggregation } from "./analytics/job";
+import { PostgresAnalyticsStore } from "./analytics/store";
 import { buildIdempotencyKey } from "./idempotency";
 import { DeadLetterQueue } from "./dead-letter";
 import {
@@ -636,6 +638,30 @@ async function main(): Promise<void> {
   await ensureEventsTable();
   await ensurePostSearchIndex();
 
+  // #652/#653: aggregate the previous UTC day's verified price observations.
+  // Runs after migrations so the analytics tables exist.
+  //
+  // Deliberately not awaited: startup must not block on an analytical query,
+  // and the history endpoints serve an empty (but valid) series until the first
+  // run lands. The job is idempotent, so a run that fails or is interrupted
+  // converges on the next run.
+  //
+  // Failure is logged rather than fatal: a missing index for one day is
+  // recoverable by a re-run, whereas refusing to start would take the API
+  // offline for every other feature.
+  runDailyIndexAggregation({ pool: pgPool })
+    .then((outcome) => {
+      logger.info("index_aggregation_complete", {
+        runDate: outcome.runDate,
+        computed: outcome.computed,
+        skipped: outcome.skipped,
+        failed: outcome.failed,
+      });
+    })
+    .catch((err) => {
+      logger.warn("index_aggregation_failed", { error: String(err) });
+    });
+
   const abortController = new AbortController();
   const eventStore = new EventStore(pgPool);
   const db = new PostgresDatabase(pgPool);
@@ -699,7 +725,13 @@ async function main(): Promise<void> {
         next();
       }
     : noopAuthMiddleware;
-  const app = createApp(db, { authMiddleware });
+  // #654/#655: the analytics store is handed to the app so /index is mounted.
+  // Omitting it leaves the other routes untouched, which is what the replay-mode
+  // path below relies on.
+  const app = createApp(db, {
+    authMiddleware,
+    analyticsStore: new PostgresAnalyticsStore(pgPool),
+  });
   const server = app.listen(PORT, HOST);
 
   console.log(`[indexer] Server ready at http://${HOST}:${PORT}`);
