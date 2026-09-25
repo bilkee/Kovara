@@ -588,6 +588,91 @@ docker run -p 3000:3000 --env-file .env Kovara-indexer
 kubectl apply -f k8s/deployment.yaml
 ```
 
+## Index analytics (#652-#655)
+
+Daily price-index aggregation with robust statistics, plus the read endpoints
+that serve it.
+
+### How the index is computed
+
+`src/analytics/index-aggregation.ts` is pure and side-effect free. The pipeline,
+in order:
+
+1. **Status and absolute bounds** — rejected and (by default) pending
+   submissions are dropped, along with non-positive values and anything outside
+   an optional `minValue`/`maxValue`. These run first so a rejected submission
+   cannot influence the thresholds used to judge the others.
+2. **MAD filter** — rejects values beyond `madThreshold` (default 3)
+   median-absolute-deviations from the median. MAD is used rather than standard
+   deviation because it is built from the same robust centre and does not let
+   outliers inflate the measure meant to detect them.
+3. **Tukey IQR fence** — rejects values outside
+   `[Q1 - 1.5*IQR, Q3 + 1.5*IQR]`, catching skew a symmetric MAD window misses.
+4. **Per-submitter cap** — `maxSubmitterShare` bounds any one address's
+   influence, dropping their excess lowest-value-first.
+
+What survives is reduced to two values, kept deliberately separate:
+
+- **Median** — the published `median_value`. Up to half the sample can be
+  arbitrarily wrong before it moves at all.
+- **Credibility-weighted mean** — the published `weighted_value`. Weights are
+  `1 / n^0.5` per submitter, so corroboration counts but volume alone does not
+  decide the index.
+
+All arithmetic is integer (`bigint`). Prices are the contract's `i128` in the
+smallest fixed-point unit, and a median that rounds differently between two runs
+is not reproducible.
+
+### Why `maxValue` matters
+
+No statistical method can distinguish a legitimate extreme from a unit mistake
+— someone submitting rent in kobo rather than naira. That is a domain bound, so
+set it per deployment if your price range is known.
+
+### Reading the exclusion log
+
+Every excluded submission is recorded in `price_index_filter_decisions` with the
+reason and the threshold that produced it. This is what makes a disputed index
+value reviewable rather than merely arguable:
+
+```bash
+curl "localhost:3000/api/v1/index/NG/rent/decisions?date=2024-01-15"
+```
+
+### Endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/index/history` | Historical index values, newest first |
+| `GET /api/v1/index/leaderboard` | Countries ranked by index, or by contribution volume with `scope=contributors` |
+| `GET /api/v1/index/:country/:category/decisions` | Filter decisions behind a published value |
+
+Query parameters: `country`, `category`, `from`, `to`, `limit`, `offset`.
+`limit` is capped at 100; `offset` is unbounded, so deep pagination is available
+but should be used with the `has_more` flag rather than assumed.
+
+An empty result is a `200` with `total: 0`, not a `404` — a country with no
+submissions yet is a fact about the world, not a bad request.
+
+### Scheduling
+
+`runDailyIndexAggregation` runs at startup for the previous UTC day, and is
+idempotent: both tables are upserted, so a re-run converges on the same state
+rather than double-counting. Cross-replica runs are serialised with a Postgres
+advisory lock, which Postgres releases automatically if a replica dies mid-run.
+
+The job takes an optional `runDate` for backfill, and `maxPairs` to bound a
+catch-up run.
+
+### Migration note
+
+`011_price_index_analytics.sql` starts at `011`, not `010`, because
+`010_event_reliability.sql` claims `010` on the
+`feature/event-processing-reliability` branch. The runner keys applied
+migrations by filename prefix alone (`migrate.ts`), so two files sharing a
+prefix means one is silently skipped. **If you add a migration while both
+branches are open, pick a prefix not already claimed.**
+
 ## Troubleshooting
 
 ### Indexer falls behind
