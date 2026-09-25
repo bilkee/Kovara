@@ -42,12 +42,16 @@
  *   ALERT_SINK_TIMEOUT_MS      - (optional) Per-sink timeout (default: 5000)
  */
 import { Pool } from "pg";
+import { randomUUID } from "crypto";
 import { streamEvents, EventHandler, RawEvent } from "./stream";
 import { createApp, AuthMiddleware } from "./api";
 import { runMigrations } from "./migrate";
 import { PostgresDatabase } from "./db";
 import { EventStore } from "./event-store";
 import { withRetry } from "./retry";
+import { RewardStore } from "./rewards/store";
+import { AuditStore } from "./audit/store";
+import { PostgresSubmissionFeed } from "./submissions/feed";
 import { runDailyIndexAggregation } from "./analytics/job";
 import { PostgresAnalyticsStore } from "./analytics/store";
 import { buildIdempotencyKey } from "./idempotency";
@@ -65,7 +69,6 @@ import {
   sentrySinkFromDsn,
   WebhookSink,
 } from "./alerting";
-import { randomUUID } from "crypto";
 import { ConfigError, IndexerConfig, loadConfig, parseStartLedger } from "./config";
 import pkg from "../package.json";
 
@@ -443,10 +446,95 @@ function trackProcessing(store: EventStore): EventHandler {
 
 // ── Event dispatch (BA-006) ───────────────────────────────────────────────────
 
+/**
+ * Audit store, created once. Constructing it per event would be harmless (it
+ * holds only a pool reference) but misleading — it reads as though the store
+ * carries per-event state.
+ */
+const auditStore = new AuditStore(pgPool);
+
+/**
+ * Record one event in the audit trail (#658).
+ *
+ * Deliberately never throws. An audit write is bookkeeping about work that has
+ * already happened; failing the event because the bookkeeping failed would let
+ * a full audit table stall the indexer and stop processing entirely. The failure
+ * is logged loudly instead, so a broken trail is visible rather than silent.
+ *
+ * A missing entry is detectable after the fact: the hash chain records where a
+ * record *should* continue from, so a gap is visible as a broken chain rather
+ * than as an indistinguishable absence.
+ */
+async function auditEvent(
+  event: RawEvent,
+  action: "event.processed" | "event.failed" | "event.replayed",
+  outcome: "success" | "failure" | "skipped",
+  detail: Record<string, unknown>
+): Promise<void> {
+  try {
+    // One stream per contract, so the chain is per-deployment and concurrent
+    // appends for different contracts do not serialise.
+    await auditStore.append(
+      {
+        stream: `contract:${event.contractId}`,
+        action,
+        actor: { kind: "system", component: "indexer" },
+        outcome,
+        subject: event.contractId,
+        ledger: event.ledger,
+        transactionHash: event.txHash,
+        // The full context needed to reconstruct what happened: which event, of
+        // which type, with what paging token. A forensic reviewer should not
+        // have to guess whether two entries describe the same event.
+        metadata: {
+          event_id: event.id,
+          event_type: event.topic[0] ?? null,
+          paging_token: event.pagingToken,
+          value: event.value,
+          ledger_closed_at: event.ledgerClosedAt,
+          ...detail,
+        },
+        occurredAt: new Date(),
+      },
+      // A fresh id per attempt, deliberately. A deterministic id would make a
+      // retried event collide and drop its record, so an event that failed five
+      // times would show only the first failure — and how many times something
+      // failed is exactly what a forensic review needs. For an audit trail,
+      // completeness beats de-duplication.
+      randomUUID()
+    );
+  } catch (err) {
+    logger.warn("audit_write_failed", {
+      eventId: event.id,
+      action,
+      error: String(err),
+    });
+  }
+}
+
 async function handleEvent(event: RawEvent, db: PostgresDatabase): Promise<void> {
   const eventType = event.topic[0];
   logger.info("event_dispatch", { ledger: event.ledger, type: eventType, tx: event.txHash });
 
+  try {
+    await dispatchEvent(event, eventType, db);
+    await auditEvent(event, "event.processed", "success", {});
+  } catch (err) {
+    // Recorded before the error propagates, so a failed event leaves a trace
+    // explaining what failed rather than only a log line that may be rotated
+    // away before anyone investigates.
+    await auditEvent(event, "event.failed", "failure", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+}
+
+async function dispatchEvent(
+  event: RawEvent,
+  eventType: string,
+  db: PostgresDatabase
+): Promise<void> {
   switch (eventType) {
     case "profile_set":
       await (await import("./handlers/profile")).handleProfileSet(db, event as never);
@@ -725,6 +813,14 @@ async function main(): Promise<void> {
         next();
       }
     : noopAuthMiddleware;
+  // #657/#658/#659: the stores are handed to the app so their routes mount.
+  // Each is optional; omitting one leaves the rest untouched, which is what the
+  // replay-mode path above relies on.
+  const app = createApp(db, {
+    authMiddleware,
+    rewardStore: new RewardStore(pgPool),
+    auditStore: new AuditStore(pgPool),
+    submissionFeed: new PostgresSubmissionFeed(pgPool),
   // #654/#655: the analytics store is handed to the app so /index is mounted.
   // Omitting it leaves the other routes untouched, which is what the replay-mode
   // path below relies on.

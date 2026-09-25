@@ -65,6 +65,12 @@ import { createProfilesRouter } from "./routes/profiles";
 import { createPostsRouter } from "./routes/posts";
 import { createFollowsRouter } from "./routes/follows";
 import { createPoolsRouter } from "./routes/pools";
+import { createSubmissionsRouter } from "./routes/submissions";
+import { createRewardsRouter } from "../rewards/routes";
+import { RewardStore } from "../rewards/store";
+import { createAuditRouter } from "../audit/routes";
+import { AuditStore } from "../audit/store";
+import { PostgresSubmissionFeed } from "../submissions/feed";
 import { createIndexRouter } from "../analytics/routes";
 import { PostgresAnalyticsStore } from "../analytics/store";
 import { createModerationRouter } from "./routes/moderation";
@@ -112,6 +118,25 @@ export interface AppOptions {
   authMiddleware?: AuthMiddleware;
 
   /**
+   * #657: reward status, claim history, and the claim endpoint.
+   *
+   * Supplied by the caller rather than built from `db`, because these stores
+   * need a `pg.Pool` and issue transactional SQL that the `Database`
+   * repository interface has no reason to expose. When a store is omitted its
+   * routes are simply not mounted, so existing deployments and tests are
+   * unaffected.
+   */
+  rewardStore?: RewardStore;
+
+  /**
+   * #658: audit log reads plus whole-stream chain verification.
+   */
+  auditStore?: AuditStore;
+
+  /**
+   * #659: the paginated, filtered submission feed.
+   */
+  submissionFeed?: PostgresSubmissionFeed;
    * #654/#655: Analytics store backing the historical index series, the country
    * leaderboard, and the filter-decision log.
    *
@@ -273,6 +298,19 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
     apiRouter.use("/pools", createPoolsRouter(db));
   }
 
+  // #659: submission feed with pagination and status/user/date filters.
+  if (options.submissionFeed) {
+    apiRouter.use("/submissions", createSubmissionsRouter(options.submissionFeed));
+  }
+
+  // #657: reward status, claim history, and the claim endpoint.
+  if (options.rewardStore) {
+    apiRouter.use("/rewards", createRewardsRouter(options.rewardStore));
+  }
+
+  // #658: audit reads and chain verification.
+  if (options.auditStore) {
+    apiRouter.use("/audit", createAuditRouter(options.auditStore));
   // #654/#655: historical index series, country leaderboards, and the filter
   // decision log. Mounted only when a store is supplied — see AppOptions.
   if (options.analyticsStore) {
