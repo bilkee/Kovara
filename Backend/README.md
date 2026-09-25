@@ -588,6 +588,147 @@ docker run -p 3000:3000 --env-file .env Kovara-indexer
 kubectl apply -f k8s/deployment.yaml
 ```
 
+## Rewards, audit, and feeds (#656-#659)
+
+### Reward calculation (#656)
+
+`src/rewards/rules.ts` is pure. It reads the recorded submission and
+verification facts and returns integers — no clock, no randomness, no globals —
+so the same stored data always produces the same rewards. That is what makes a
+disputed payout arguable rather than mysterious.
+
+| Rule | Behaviour |
+| --- | --- |
+| Rejected submission | Pays nothing — not to the submitter, and not to the verifier who rejected it. Rejecting bad data is a cost the protocol bears, not a paid service. |
+| Pending submission | Pays nothing yet; verifier rewards are also withheld, because a pending submission can still be rejected. |
+| Verified submission | `base`, scaled by the corroboration multiplier, plus `verificationReward` to each deduplicated approving verifier. |
+| Flagged for review | The submitter's reward is **held** at `pendingReviewBps` and marked `pending`, not `claimable`. Held rather than clawed back, so a reversal never has to recover money already spent. |
+
+Corroboration is weighted `1/n^0.5` per submitter and capped, so agreement is
+rewarded but a colluding group cannot scale a payout without limit.
+
+**Duplicate votes are prevented twice.** In application code by
+`dedupeVerifications`, and in the database by `PRIMARY KEY (submission_id,
+verifier)` on `verifications` — so the rule holds even if a caller forgets to
+check. The *first* vote is the one that counts: a verifier who approves and then
+rejects is recorded as a duplicate rather than converting an approval into a
+rejection, because letting someone change their vote after seeing the reward
+would make the reward a function of when they looked.
+
+**Self-verification pays nothing.** An address cannot both create data and
+certify it.
+
+All amounts are `bigint`; multipliers are basis points applied with integer
+arithmetic, so the rules and the ledger cannot drift apart by a rounding step.
+
+### Claims (#657)
+
+`processing` is a real state, not a formality.
+
+- **No double-claim.** Accruals are claimed under `FOR UPDATE`, so two
+  concurrent claims of the same rows serialise and the second finds nothing
+  claimable. `idempotency_key` is `UNIQUE`, and that constraint — not the
+  application check — is what makes a concurrent retry resolve to one payout.
+- **A failed payout releases the accruals** back to `claimable`. A crash
+  mid-payout leaves the money `processing` and visible as such, rather than lost
+  or double-paid.
+- **A completed claim is never reversed.** The transfer already happened;
+  pretending otherwise would be a lie in the ledger.
+
+Balances are always derived by summing `reward_accruals`; no running total is
+stored, so a total and its underlying lines cannot disagree. An in-flight claim
+is reported separately from `claimed` so a payout in progress reads as in
+progress.
+
+```
+GET  /api/v1/rewards/:address
+GET  /api/v1/rewards/:address/claims?state=&limit=&offset=
+GET  /api/v1/rewards/:address/accruals?state=&limit=&offset=
+POST /api/v1/rewards/:address/claim      { "idempotency_key": "..." }
+```
+
+`idempotency_key` is **required** on claim. A client that times out mid-request
+cannot tell whether the payout landed, so a retry has to be safe by default —
+which means the key comes from the caller, not from the server. Reusing a key
+returns the original claim and moves no money.
+
+A claim with nothing claimable returns `200` with a zero-amount `processing`
+claim: that is a statement about the caller's balance, not a server fault.
+
+### Audit log (#658)
+
+An audit log that an operator with write access can quietly edit is not an audit
+log. Each entry hashes its own canonical content **and** the previous entry's
+hash:
+
+```
+hash(n) = SHA256(canonical(record n) || hash(n-1))
+```
+
+Altering or removing any record breaks verification for every record after it,
+and `GET /api/v1/audit/:stream/verify` reports the first break. The canonical
+form is fixed-order and length-prefixed, not `JSON.stringify` of an arbitrary
+object: field order is not guaranteed across versions, and without a length
+prefix `{a: "bc"}` and `{ab: "c"}` could hash identically.
+
+The chain is **per stream** (one per contract), so concurrent writers for
+different contracts do not serialise. Appends lock the stream's head row — the
+alternative, read-head-then-insert, lets two concurrent appends read the same
+head and silently fork the chain.
+
+> **Operational note.** The chain only means something if the application role
+> cannot `UPDATE` or `DELETE` `audit_log` in production. Revoke those grants
+> after setup:
+>
+> ```sql
+> REVOKE UPDATE, DELETE ON audit_log FROM <app_role>;
+> ```
+
+Audit writes never fail an event. A full audit table must not stall the indexer,
+so a write error is logged loudly and the event proceeds; a gap is detectable
+afterwards because the chain records where a record should have continued from.
+
+```
+GET /api/v1/audit?stream=&action=&outcome=&subject=&actor=&ledger=&from=&to=&limit=&offset=
+GET /api/v1/audit/:stream/verify
+```
+
+### Submission feed (#659)
+
+```
+GET /api/v1/submissions?status=&submitter=&country=&category=&from=&to=&limit=&offset=&summary=true
+GET /api/v1/submissions/:id
+```
+
+Filters combine with AND. An unrecognised `status` is a `400` rather than being
+ignored — silently returning everything because a client typo'd a filter is the
+failure most likely to go unnoticed, because the response is still a
+plausible-looking list. An empty feed is `200` with `total: 0`, not `404`.
+
+Ordering is `submitted_at DESC, id DESC`. The `id` tiebreak is what makes offset
+pagination consistent: without it, two rows sharing a timestamp can swap places
+between pages and a client sees a record twice or misses one. `has_more` is
+derived from the returned row count, so the final page reports `false` even when
+`total` is an exact multiple of the page size.
+
+`summary=true` returns a per-status breakdown. It deliberately ignores the
+`status` filter — a summary that could only ever report the one status that was
+filtered to would be useless.
+
+> Offset paging is the right choice for a stable snapshot, and the wrong one for
+> a continuously-written feed, where inserts during a walk shift the window. If
+> this feed needs to be tailed, add a keyset variant (`?after=<id>`) rather than
+> raising the offset cap.
+
+### Migration note
+
+`012_rewards_audit_submissions.sql` follows `010` (PR #773) and `011` (PR #774).
+The runner keys applied migrations by **filename prefix alone**, so each number
+is claimed by exactly one file. Note that `upstream/main` already has three
+`007_*.sql` and three `008_*.sql` files, so by that same rule only the first of
+each is ever applied — worth confirming those columns and indexes exist in your
+environment.
+
 ## Troubleshooting
 
 ### Indexer falls behind
