@@ -2,11 +2,11 @@ import "express-async-errors";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import rateLimit, { RateLimitRequestHandler } from "express-rate-limit";
-import crypto from "crypto";
 import { Database } from "../db";
 import { ApiErrorResponse, DebugSnapshot } from "./contracts";
 import { sendError, sendNotFound } from "./response";
 import { logger } from "../logger";
+import { requestIdMiddleware } from "../request-context";
 import pkg from "../../package.json";
 import {
   addressRateLimiter,
@@ -67,6 +67,8 @@ import { createFollowsRouter } from "./routes/follows";
 import { createPoolsRouter } from "./routes/pools";
 import { createIndexRouter } from "../analytics/routes";
 import { PostgresAnalyticsStore } from "../analytics/store";
+import { createModerationRouter } from "./routes/moderation";
+import { ModerationStore } from "../verification/moderation";
 
 // ── Auth middleware (BE-25) ───────────────────────────────────────────────────
 
@@ -179,16 +181,6 @@ export function isDatabaseError(err: unknown): boolean {
   return false;
 }
 
-// ── Request correlation ID ─────────────────────────────────────────────────
-
-declare global {
-  namespace Express {
-    interface Request {
-      correlationId?: string;
-    }
-  }
-}
-
 // ── App factory ───────────────────────────────────────────────────────────────
 
 export function createApp(db: Database, options: AppOptions = {}): express.Application {
@@ -219,12 +211,11 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
     app.set("trust proxy", TRUST_PROXY);
   }
 
-  // ── Correlation ID middleware ────────────────────────────────────────────────
-  app.use((req: Request, _res: Response, next: NextFunction): void => {
-    const id = (req.headers["x-correlation-id"] as string) || crypto.randomUUID();
-    req.correlationId = id;
-    next();
-  });
+  // ── Request ID middleware (#684) ─────────────────────────────────────────────
+  // Resolves or generates the request id, exposes it to handlers and logs, and
+  // echoes it on every response — replacing the per-route X-Correlation-Id
+  // echoes that only covered a subset of routes.
+  app.use(requestIdMiddleware);
 
   // ── Health check (unlimited) ────────────────────────────────────────────────
   app.get("/health", async (_req: Request, res: Response): Promise<void> => {
@@ -271,6 +262,11 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
   apiRouter.use("/profiles", createProfilesRouter(db));
   apiRouter.use("/posts", createPostsRouter(db));
   apiRouter.use("/follows", createFollowsRouter(db));
+
+  // Moderation / fraud review (issue #645). The store is created once per app so
+  // cases and their action logs survive across requests; a per-request store
+  // would make every case unreachable a moment after it was filed.
+  apiRouter.use("/moderation", createModerationRouter(new ModerationStore()));
 
 // Conditionally mount experimental routes
   if (process.env.EXPERIMENTAL_FEATURES === "true") {
@@ -530,3 +526,4 @@ const _stub = {} as any;
 export const app = createApp(_stub);
 
 // Server is now started from the main index.ts entry point
+

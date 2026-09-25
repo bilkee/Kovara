@@ -19,7 +19,14 @@
 import { logger } from "./logger";
 
 import { normalizeRawEvent } from "./normalize";
-import { withRetry } from "./retry";
+import {
+  withRetry,
+  classifyFailure,
+  isPermanentError,
+  DEFAULT_MAX_ATTEMPTS,
+} from "./retry";
+import { buildIdempotencyKey } from "./idempotency";
+import { DeadLetterQueue, DeadLetterReason } from "./dead-letter";
 import { EventStore } from "./event-store";
 
     // current.requestCount++;
@@ -63,6 +70,12 @@ export interface StreamConfig {
    * handler (e.g. status tracking) as before.
    */
   maxHandlerRetries?: number;
+  /**
+   * #650: Optional dead-letter queue. When set, an event that exhausts its retry
+   * budget (or fails permanently) is recorded here with its full payload, so
+   * the failure is inspectable and requeueable rather than only logged.
+   */
+  deadLetterQueue?: DeadLetterQueue;
 }
 
 export type EventHandler = (event: RawEvent) => Promise<void>;
@@ -103,6 +116,12 @@ export function verifyContractOwnership(event: RawEvent, contractedContractId: s
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 const MAX_EVENTS_PER_PAGE = 100;
+/**
+ * #649: Handler attempts (the first try plus retries) before a failure is
+ * dead-lettered. Shares the default with `retry.ts` so the RPC fetch and the
+ * handler dispatch have one documented budget.
+ */
+const DEFAULT_MAX_HANDLER_RETRIES = DEFAULT_MAX_ATTEMPTS;
 /**
  * BA-035: Cap for the progressive RPC backoff. After prolonged failures the
  * inter-poll delay grows toward this ceiling (60s) and resets on success.
@@ -282,6 +301,7 @@ export async function streamEvents(
 ): Promise<void> {
   const pollMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const maxCacheSize = config.dedupCacheSize ?? DEFAULT_DEDUP_CACHE_SIZE;
+  const deadLetterQueue = config.deadLetterQueue;
   let cursor: string | undefined;
   let startLedger = config.startLedger;
 
@@ -336,31 +356,19 @@ export async function streamEvents(
       // BA-037: remember the cursor we are fetching from so we can detect
       // pagination that makes no forward progress.
       const fetchCursor = cursor;
-  while (!signal.aborted) {    try {
       const { events, latestLedger } = await withRetry(
         () => fetchEvents(config.rpcUrl, config.contractId, startLedger, fetchCursor),
         {
           maxAttempts: 3,
           baseDelayMs: 300,
           backoffMultiplier: 2,
-          isRetryable: (err: unknown) => {
-            if (err instanceof Error) {
-              const msg = err.message.toLowerCase();
-              return (
-                msg.includes("econnreset") ||
-                msg.includes("econnrefused") ||
-                msg.includes("socket hang up") ||
-                msg.includes("timeout") ||
-                msg.includes("failed to fetch") ||
-                msg.includes("network") ||
-                msg.includes("502") ||
-                msg.includes("503") ||
-                msg.includes("504")
-              );
-            }
-            return true;
-          },
+          // #649: No isRetryable override — let classifyFailure decide. The
+          // previous hand-rolled predicate returned `true` for any non-Error
+          // and for messages it did not recognise, which retried permanent
+          // failures such as a malformed-response validation error.
           operationLabel: "fetchEvents",
+          log: logger,
+          signal,
         }
       );
 
@@ -418,35 +426,74 @@ export async function streamEvents(
 
         // BA-034: a handler error must NOT advance the cursor, so the failed
         // event is retried on a subsequent fetch instead of being lost.
+        //
+        // #648/#649/#650: the retry and dead-letter decision is made here rather
+        // than by a blind re-dispatch. A transient failure is retried with
+        // jittered backoff; a permanent one, or a transient one that has
+        // exhausted its budget, is written to the dead-letter queue with enough
+        // context to debug it. Either way the cursor is not advanced, so the
+        // event is revisited on the next pass.
+        const idempotencyKey = buildIdempotencyKey(
+          normalizedEvent.contractId,
+          normalizedEvent.ledger,
+          normalizedEvent.id
+        );
+
         try {
-          await handler(normalizedEvent);
+          await withRetry(() => handler(normalizedEvent), {
+            maxAttempts: config.maxHandlerRetries ?? DEFAULT_MAX_HANDLER_RETRIES,
+            operationLabel: `handleEvent:${normalizedEvent.type}`,
+            log: logger,
+            signal,
+          });
+          // Processing succeeded, so this event no longer owes a retry.
+          deadLetterQueue?.reset(idempotencyKey);
         } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const reason: DeadLetterReason = isPermanentError(err)
+            ? "permanent_failure"
+            : "retries_exhausted";
+
           logger.error("handler_error", {
             eventId: normalizedEvent.id,
             eventType: normalizedEvent.type,
+            classification: classifyFailure(err),
+            attempts: deadLetterQueue?.attemptsFor(idempotencyKey) ?? 0,
             err,
           });
-          console.error(
-            `[stream] Handler error for event ${normalizedEvent.id} (type=${normalizedEvent.type}), will retry:`,
-            err
-          );
-          pageFailed = true;
-          break;
-          // BA-031: Route repeated failures to the durable dead-letter path so
-          // they are retained and can be safely retried by operators. The
-          // cursor is NOT advanced on failure so the same event is revisited.
-          if (config.store) {
+
+          if (deadLetterQueue) {
+            const deadLettered = await deadLetterQueue.fail(idempotencyKey, {
+              eventId: normalizedEvent.id,
+              contractId: normalizedEvent.contractId,
+              txHash: normalizedEvent.txHash,
+              ledger: normalizedEvent.ledger,
+              topic: normalizedEvent.topic,
+              value: normalizedEvent.value,
+              error: message,
+            });
+            if (deadLettered) {
+              logger.error("event_dead_lettered", {
+                eventId: normalizedEvent.id,
+                reason: deadLettered,
+                attempts: deadLetterQueue.attemptsFor(idempotencyKey),
+              });
+            }
+          } else if (config.store) {
+            // No queue configured: fall back to the durable status column so
+            // the failure is at least retained and inspectable.
             try {
-              const message = err instanceof Error ? err.message : String(err);
               await config.store.deadLetter(normalizedEvent.id, message);
             } catch (storeErr) {
-              logger.warn(
-                `[stream] Could not dead-letter event ${normalizedEvent.id}:`,
-                storeErr
-              );
+              logger.warn("Could not dead-letter event", {
+                eventId: normalizedEvent.id,
+                err: storeErr,
+              });
             }
           }
-          continue;
+
+          pageFailed = true;
+          break;
         }
 
         markSeen(normalizedEvent.id);
@@ -580,14 +627,10 @@ export async function replayLedgerRange(
             maxAttempts: 3,
             baseDelayMs: 300,
             backoffMultiplier: 2,
-            isRetryable: (err: unknown) => {
-              if (err instanceof Error) {
-                const msg = err.message.toLowerCase();
-                return msg.includes("timeout") || msg.includes("econnreset") || msg.includes("503");
-              }
-              return true;
-            },
+            // #649: classifyFailure decides, as in the live stream.
             operationLabel: "replayFetchEvents",
+            log: logger,
+            signal,
           },
         );
 
@@ -672,6 +715,4 @@ export async function replayEventTypes(
     handler,
     signal,
   );
-}
-  logger.always("Stopped.");
 }
