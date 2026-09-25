@@ -2,6 +2,10 @@
 
 Event indexer for the Kovara Social contract on Stellar. Processes on-chain events and maintains a queryable database for the frontend.
 
+> **Verified reference docs.** See [`docs/backend/`](../docs/backend/README.md) for
+> the architecture, REST API contracts, and operational runbook derived from the
+> code. When this README and those pages disagree, the code is the source of truth.
+
 ## Architecture
 
 The indexer listens to Stellar contract events and processes them into a PostgreSQL database:
@@ -88,6 +92,87 @@ machine-readable `code` field:
 ```json
 { "error": "Profile not found", "code": "NOT_FOUND" }
 ```
+
+## Event-Processing Reliability
+
+A ledger event can legitimately be delivered more than once — `getEvents` pages
+overlap on a cursor replay, a restart resumes from a persisted cursor, an
+operator replays a range, or two replicas race during a handoff. These modules
+make each of those a no-op rather than a second write.
+
+| Module | Issue | Responsibility |
+| --- | --- | --- |
+| `src/idempotency.ts` | #648 | Derives, validates and parses the stable key for an event; `runOnce` executes a unit of work at most once per key. |
+| `src/retry.ts` | #649 | `classifyFailure` splits errors into transient/permanent; `withRetry` applies jittered exponential backoff to the transient ones only. |
+| `src/dead-letter.ts` | #650 | Counts attempts per event and dead-letters an unrecoverable failure with the full payload needed to debug and requeue it. |
+| `src/aggregation/` | #651 | Daily price-index aggregation, leased so a day is computed exactly once across replicas. |
+
+### Transient vs permanent
+
+Retrying a permanent failure (a malformed payload, a unique-constraint
+violation, a 4xx from the provider) burns the retry budget on work that can
+never succeed and delays the dead-letter signal. `classifyFailure` therefore
+checks, in order: an explicit `code` (SQLSTATE / syscall), then permanent
+message markers, then transient markers, and **defaults to permanent** — an
+error we do not understand cannot be fixed by repeating it, and the dead-letter
+path exists so a human can look at it.
+
+Backoff is exponential with **full jitter** (`random() * backoff`) rather than a
+fixed delay: when a dependency restarts every replica fails at the same instant,
+and a deterministic schedule would have them all retry in lockstep and reproduce
+the overload.
+
+### Idempotency keys
+
+Keys are **derived, never caller-supplied**:
+
+```
+kovara:event:v1:<contractId>:<ledger>:<eventId>
+```
+
+Deriving them means a caller cannot reuse a key across two different events
+(which would silently swallow the second). Uniqueness is enforced by the
+database — `events.idempotency_key` has a unique index, and `persistEvent`
+inserts with `ON CONFLICT DO NOTHING` — so two processes racing on the same
+event cannot both win.
+
+### Dead-letter queue
+
+An event that fails permanently, or that has exhausted its retry budget, is
+written to `event_dead_letters` with its topic, raw value, tx hash, ledger,
+error and attempt count, so it can be reproduced and fixed. The queue keeps the
+payload **unredacted** on purpose (log lines still redact payloads via
+`src/logger.ts`): a redacted queue is useless for debugging. Records are
+append-only; requeueing sets `requeued_at` rather than editing history.
+
+`dead` events are excluded from startup recovery — they wait for an operator to
+requeue them, and reclaiming them on every restart would defeat the queue.
+
+### Daily aggregation
+
+`AggregationScheduler` runs once an interval (default hourly) and aggregates the
+most recent day that is still outstanding, so a window missed while the process
+was down is caught up rather than skipped. Each run row in `aggregation_runs` is
+the lease: a day is computed exactly once across replicas, a failed day stays
+retryable, and the outcome is recorded either way.
+
+Every aggregate carries both `run_date` (the day summarised) and `computed_at`
+(when the job actually ran). They differ on a catch-up run, and conflating them
+would make a late-computed historical day indistinguishable from a fresh one.
+
+Prices are stored as `NUMERIC`, not `BIGINT`: the contract type is `i128`, and a
+BIGINT would overflow on any token with 7+ decimals scaled into the smallest
+unit, publishing a rounded — and wrong — cost-of-living index.
+
+### Environment variables
+
+All optional; the defaults are the ones documented in the modules above.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_HANDLER_RETRIES` | `3` | Handler attempts before a failure is dead-lettered |
+| `AGGREGATION_INTERVAL_MS` | `3600000` | Daily aggregation tick interval |
+| `AGGREGATION_CATCH_UP_DAYS` | `7` | How many days back to catch up |
 
 | HTTP Status | Code                | Description                     |
 |-------------|---------------------|---------------------------------|
@@ -728,6 +813,90 @@ is claimed by exactly one file. Note that `upstream/main` already has three
 `007_*.sql` and three `008_*.sql` files, so by that same rule only the first of
 each is ever applied — worth confirming those columns and indexes exist in your
 environment.
+## Index analytics (#652-#655)
+
+Daily price-index aggregation with robust statistics, plus the read endpoints
+that serve it.
+
+### How the index is computed
+
+`src/analytics/index-aggregation.ts` is pure and side-effect free. The pipeline,
+in order:
+
+1. **Status and absolute bounds** — rejected and (by default) pending
+   submissions are dropped, along with non-positive values and anything outside
+   an optional `minValue`/`maxValue`. These run first so a rejected submission
+   cannot influence the thresholds used to judge the others.
+2. **MAD filter** — rejects values beyond `madThreshold` (default 3)
+   median-absolute-deviations from the median. MAD is used rather than standard
+   deviation because it is built from the same robust centre and does not let
+   outliers inflate the measure meant to detect them.
+3. **Tukey IQR fence** — rejects values outside
+   `[Q1 - 1.5*IQR, Q3 + 1.5*IQR]`, catching skew a symmetric MAD window misses.
+4. **Per-submitter cap** — `maxSubmitterShare` bounds any one address's
+   influence, dropping their excess lowest-value-first.
+
+What survives is reduced to two values, kept deliberately separate:
+
+- **Median** — the published `median_value`. Up to half the sample can be
+  arbitrarily wrong before it moves at all.
+- **Credibility-weighted mean** — the published `weighted_value`. Weights are
+  `1 / n^0.5` per submitter, so corroboration counts but volume alone does not
+  decide the index.
+
+All arithmetic is integer (`bigint`). Prices are the contract's `i128` in the
+smallest fixed-point unit, and a median that rounds differently between two runs
+is not reproducible.
+
+### Why `maxValue` matters
+
+No statistical method can distinguish a legitimate extreme from a unit mistake
+— someone submitting rent in kobo rather than naira. That is a domain bound, so
+set it per deployment if your price range is known.
+
+### Reading the exclusion log
+
+Every excluded submission is recorded in `price_index_filter_decisions` with the
+reason and the threshold that produced it. This is what makes a disputed index
+value reviewable rather than merely arguable:
+
+```bash
+curl "localhost:3000/api/v1/index/NG/rent/decisions?date=2024-01-15"
+```
+
+### Endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/index/history` | Historical index values, newest first |
+| `GET /api/v1/index/leaderboard` | Countries ranked by index, or by contribution volume with `scope=contributors` |
+| `GET /api/v1/index/:country/:category/decisions` | Filter decisions behind a published value |
+
+Query parameters: `country`, `category`, `from`, `to`, `limit`, `offset`.
+`limit` is capped at 100; `offset` is unbounded, so deep pagination is available
+but should be used with the `has_more` flag rather than assumed.
+
+An empty result is a `200` with `total: 0`, not a `404` — a country with no
+submissions yet is a fact about the world, not a bad request.
+
+### Scheduling
+
+`runDailyIndexAggregation` runs at startup for the previous UTC day, and is
+idempotent: both tables are upserted, so a re-run converges on the same state
+rather than double-counting. Cross-replica runs are serialised with a Postgres
+advisory lock, which Postgres releases automatically if a replica dies mid-run.
+
+The job takes an optional `runDate` for backfill, and `maxPairs` to bound a
+catch-up run.
+
+### Migration note
+
+`011_price_index_analytics.sql` starts at `011`, not `010`, because
+`010_event_reliability.sql` claims `010` on the
+`feature/event-processing-reliability` branch. The runner keys applied
+migrations by filename prefix alone (`migrate.ts`), so two files sharing a
+prefix means one is silently skipped. **If you add a migration while both
+branches are open, pick a prefix not already claimed.**
 
 ## Troubleshooting
 
@@ -756,3 +925,4 @@ See [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
 ## License
 
 MIT
+

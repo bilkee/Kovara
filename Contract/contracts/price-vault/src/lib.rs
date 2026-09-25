@@ -211,8 +211,84 @@ use soroban_sdk::{
 //! always produces identical return values, satisfying acceptance criterion 3.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
+
+// ── Identifier registry (issue #689) ──────────────────────────────────
+
+/// The supported country and basket-category identifiers.
+///
+/// Country codes are ISO 3166-1 alpha-2 identifiers the protocol supports —
+/// a real subset of the standard, never an invented alphabet. Categories are
+/// the cost-of-living basket keys the protocol tracks.
+///
+/// The registry is deliberately not encoded in any storage key. Every stored
+/// record references an identifier by `Symbol`, and the identifier is validated
+/// against this registry at the contract boundary, so adding a country or a
+/// category later is a code change that leaves previously stored records — and
+/// their keys — untouched. Extending the registry therefore needs no storage
+/// migration and cannot invalidate existing submissions.
+pub mod registry {
+    use soroban_sdk::{Env, Symbol, Vec};
+
+    /// Supported ISO 3166-1 alpha-2 country codes.
+    ///
+    /// A real subset of the standard: each entry is a designated ISO 3166-1
+    /// alpha-2 identifier. Extend this list to add a country.
+    pub const COUNTRY_CODES: &[&str] = &[
+        "US", "GB", "NG", "KE", "IN", "BR", "DE", "FR", "JP", "CN", "ZA", "GH", "EG", "TZ", "UG",
+        "ET", "PH", "ID", "MX", "AR",
+    ];
+
+    /// Supported cost-of-living basket categories.
+    ///
+    /// Extend this list to add a category.
+    pub const CATEGORIES: &[&str] = &["Food", "Rent", "Transport", "Utilities", "Health"];
+
+    /// Version of the identifier registry.
+    ///
+    /// Bump this when an identifier is added or removed so clients and indexers
+    /// can tell which registry a deployment was built against.
+    pub const VERSION: u32 = 1;
+
+    /// Every supported country code, as `Symbol`s.
+    pub fn countries(env: &Env) -> Vec<Symbol> {
+        let mut codes = Vec::new(env);
+        for code in COUNTRY_CODES.iter() {
+            codes.push_back(Symbol::new(env, code));
+        }
+        codes
+    }
+
+    /// Every supported basket category, as `Symbol`s.
+    pub fn categories(env: &Env) -> Vec<Symbol> {
+        let mut keys = Vec::new(env);
+        for key in CATEGORIES.iter() {
+            keys.push_back(Symbol::new(env, key));
+        }
+        keys
+    }
+
+    /// Whether `country_iso` is a supported ISO 3166-1 alpha-2 identifier.
+    pub fn is_supported_country(env: &Env, country_iso: &Symbol) -> bool {
+        for code in COUNTRY_CODES.iter() {
+            if &Symbol::new(env, code) == country_iso {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `category` is a supported basket category identifier.
+    pub fn is_supported_category(env: &Env, category: &Symbol) -> bool {
+        for key in CATEGORIES.iter() {
+            if &Symbol::new(env, key) == category {
+                return true;
+            }
+        }
+        false
+    }
+}
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -247,6 +323,10 @@ pub enum Error {
     /// are part of the contract ABI, so renumbering an existing variant would
     /// silently change the code every deployed client already maps.
     InvalidRange = 9,
+    /// The country code is not a supported ISO 3166-1 alpha-2 identifier.
+    InvalidCountry = 10,
+    /// The category is not a supported basket category identifier.
+    InvalidCategory = 11,
 }
 
 // ── payload module ────────────────────────────────────────────────────────────
@@ -642,6 +722,36 @@ impl PriceSubmission {
     }
 }
 
+// ── Events ────────────────────────────────────────────────────────────────────
+
+/// Emitted when a price submission is successfully recorded (issue #694).
+///
+/// `country_iso` and `category` are topics — the two dimensions an indexer
+/// filters on — so a consumer can subscribe to just the submissions it cares
+/// about without decoding every event body. The body carries the rest of the
+/// submission metadata (submitter, value, validity window, initial status and
+/// schema version) so an indexer can build its record from the event alone.
+///
+/// Emitted only after both the record and its history-index entry have been
+/// written, so a consumer that reacts to the event can read the submission back
+/// immediately. A replayed submission that is a no-op emits nothing.
+#[contractevent]
+#[derive(Clone)]
+pub struct PriceSubmitted {
+    #[topic]
+    pub country_iso: Symbol,
+
+    #[topic]
+    pub category: Symbol,
+
+    pub submitter: Address,
+    pub value: i128,
+    pub valid_from: u64,
+    pub valid_until: u64,
+    pub status: SubmissionStatus,
+    pub schema_version: u32,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -713,6 +823,17 @@ impl PriceVault {
                 schema_version: SCHEMA_VERSION,
             },
         )?;
+
+        // Identifier registry: country and category must be supported
+        // identifiers, not arbitrary symbols. Checked alongside the payload
+        // schema, before auth and before any storage access.
+        if !registry::is_supported_country(&env, &country_iso) {
+            return Err(Error::InvalidCountry);
+        }
+        if !registry::is_supported_category(&env, &category) {
+            return Err(Error::InvalidCategory);
+        }
+
         // Validate timestamp first (pre-existing check).
         if timestamp == 0 {
             return Err(Error::InvalidTimestamp);
@@ -742,7 +863,7 @@ impl PriceVault {
             &DataKey::Price(country_iso.clone(), category.clone(), valid_from),
             &key,
             &PriceSubmission {
-                submitter,
+                submitter: submitter.clone(),
                 country_iso: country_iso.clone(),
                 category: category.clone(),
                 value,
@@ -764,7 +885,40 @@ impl PriceVault {
         index.push_back(timestamp);
         env.storage().persistent().set(&idx_key, &index);
 
+        // Successful-submission event: emitted only after both the record and
+        // its index entry are stored, so a consumer that observes it can read
+        // the submission back immediately. The replay no-op above returns
+        // before this point, so duplicate attempts emit nothing.
+        PriceSubmitted {
+            country_iso,
+            category,
+            submitter,
+            value,
+            valid_from,
+            valid_until,
+            status: SubmissionStatus::Pending,
+            schema_version: SCHEMA_VERSION,
+        }
+        .publish(&env);
+
         Ok(())
+    }
+
+    // ── Identifier registry (issue #689) ────────────────────────────────
+
+    /// The supported ISO 3166-1 alpha-2 country codes.
+    pub fn supported_countries(env: Env) -> Vec<Symbol> {
+        registry::countries(&env)
+    }
+
+    /// The supported cost-of-living basket categories.
+    pub fn supported_categories(env: Env) -> Vec<Symbol> {
+        registry::categories(&env)
+    }
+
+    /// The identifier-registry version this build was compiled against.
+    pub fn registry_version(_env: Env) -> u32 {
+        registry::VERSION
     }
 
     // ── Read entry points ─────────────────────────────────────────────────
@@ -2705,3 +2859,4 @@ mod tests {
         assert_eq!(err, Error::NegativeNotAllowed);
     }
 }
+
