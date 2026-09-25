@@ -65,6 +65,8 @@ import { createProfilesRouter } from "./routes/profiles";
 import { createPostsRouter } from "./routes/posts";
 import { createFollowsRouter } from "./routes/follows";
 import { createPoolsRouter } from "./routes/pools";
+import { createModerationRouter } from "./routes/moderation";
+import { ModerationStore } from "../verification/moderation";
 
 // ── Auth middleware (BE-25) ───────────────────────────────────────────────────
 
@@ -257,6 +259,11 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
   apiRouter.use("/profiles", createProfilesRouter(db));
   apiRouter.use("/posts", createPostsRouter(db));
   apiRouter.use("/follows", createFollowsRouter(db));
+
+  // Moderation / fraud review (issue #645). The store is created once per app so
+  // cases and their action logs survive across requests; a per-request store
+  // would make every case unreachable a moment after it was filed.
+  apiRouter.use("/moderation", createModerationRouter(new ModerationStore()));
 
 // Conditionally mount experimental routes
   if (process.env.EXPERIMENTAL_FEATURES === "true") {
