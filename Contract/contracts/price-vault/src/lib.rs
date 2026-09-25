@@ -211,7 +211,7 @@ use soroban_sdk::{
 //! always produces identical return values, satisfying acceptance criterion 3.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
 // ── Identifier registry (issue #689) ──────────────────────────────────
@@ -722,6 +722,36 @@ impl PriceSubmission {
     }
 }
 
+// ── Events ────────────────────────────────────────────────────────────────────
+
+/// Emitted when a price submission is successfully recorded (issue #694).
+///
+/// `country_iso` and `category` are topics — the two dimensions an indexer
+/// filters on — so a consumer can subscribe to just the submissions it cares
+/// about without decoding every event body. The body carries the rest of the
+/// submission metadata (submitter, value, validity window, initial status and
+/// schema version) so an indexer can build its record from the event alone.
+///
+/// Emitted only after both the record and its history-index entry have been
+/// written, so a consumer that reacts to the event can read the submission back
+/// immediately. A replayed submission that is a no-op emits nothing.
+#[contractevent]
+#[derive(Clone)]
+pub struct PriceSubmitted {
+    #[topic]
+    pub country_iso: Symbol,
+
+    #[topic]
+    pub category: Symbol,
+
+    pub submitter: Address,
+    pub value: i128,
+    pub valid_from: u64,
+    pub valid_until: u64,
+    pub status: SubmissionStatus,
+    pub schema_version: u32,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -833,7 +863,7 @@ impl PriceVault {
             &DataKey::Price(country_iso.clone(), category.clone(), valid_from),
             &key,
             &PriceSubmission {
-                submitter,
+                submitter: submitter.clone(),
                 country_iso: country_iso.clone(),
                 category: category.clone(),
                 value,
@@ -854,6 +884,22 @@ impl PriceVault {
             .unwrap_or_else(|| Vec::new(&env));
         index.push_back(timestamp);
         env.storage().persistent().set(&idx_key, &index);
+
+        // Successful-submission event: emitted only after both the record and
+        // its index entry are stored, so a consumer that observes it can read
+        // the submission back immediately. The replay no-op above returns
+        // before this point, so duplicate attempts emit nothing.
+        PriceSubmitted {
+            country_iso,
+            category,
+            submitter,
+            value,
+            valid_from,
+            valid_until,
+            status: SubmissionStatus::Pending,
+            schema_version: SCHEMA_VERSION,
+        }
+        .publish(&env);
 
         Ok(())
     }
