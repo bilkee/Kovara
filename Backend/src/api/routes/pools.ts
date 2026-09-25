@@ -37,10 +37,6 @@ export function createPoolsRouter(db: Database): Router {
   router.get(
     "/",
     async (req: Request, res: Response<PoolListResponse | ApiErrorResponse>): Promise<void> => {
-      if (req.correlationId) {
-        res.set("X-Correlation-Id", req.correlationId);
-      }
-
       const rawLimit = req.query.limit !== undefined ? Number(req.query.limit) : DEFAULT_LIMIT;
       const rawOffset = req.query.offset !== undefined ? Number(req.query.offset) : DEFAULT_OFFSET;
 

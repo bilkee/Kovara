@@ -331,6 +331,8 @@ describe("SentrySink", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("https://o0.ingest.sentry.io/api/0/store/");
     expect(calls[0].headers["X-Sentry-Auth"]).toContain("sentry_key=abc123def456");
+    // #684: the originating request id travels with the outbound alert call.
+    expect(calls[0].headers["x-request-id"]).toBe("corr-9");
 
     const payload = JSON.parse(calls[0].body);
     expect(payload.level).toBe("fatal");
@@ -505,3 +507,4 @@ describe("installLoggerAlerting — logger hook integration", () => {
     expect(manager.enabled).toBe(false);
   });
 });
+

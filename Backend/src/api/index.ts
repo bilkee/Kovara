@@ -2,11 +2,11 @@ import "express-async-errors";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import rateLimit, { RateLimitRequestHandler } from "express-rate-limit";
-import crypto from "crypto";
 import { Database } from "../db";
 import { ApiErrorResponse, DebugSnapshot } from "./contracts";
 import { sendError, sendNotFound } from "./response";
 import { logger } from "../logger";
+import { requestIdMiddleware } from "../request-context";
 import pkg from "../../package.json";
 import {
   addressRateLimiter,
@@ -167,16 +167,6 @@ export function isDatabaseError(err: unknown): boolean {
   return false;
 }
 
-// ── Request correlation ID ─────────────────────────────────────────────────
-
-declare global {
-  namespace Express {
-    interface Request {
-      correlationId?: string;
-    }
-  }
-}
-
 // ── App factory ───────────────────────────────────────────────────────────────
 
 export function createApp(db: Database, options: AppOptions = {}): express.Application {
@@ -207,12 +197,11 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
     app.set("trust proxy", TRUST_PROXY);
   }
 
-  // ── Correlation ID middleware ────────────────────────────────────────────────
-  app.use((req: Request, _res: Response, next: NextFunction): void => {
-    const id = (req.headers["x-correlation-id"] as string) || crypto.randomUUID();
-    req.correlationId = id;
-    next();
-  });
+  // ── Request ID middleware (#684) ─────────────────────────────────────────────
+  // Resolves or generates the request id, exposes it to handlers and logs, and
+  // echoes it on every response — replacing the per-route X-Correlation-Id
+  // echoes that only covered a subset of routes.
+  app.use(requestIdMiddleware);
 
   // ── Health check (unlimited) ────────────────────────────────────────────────
   app.get("/health", async (_req: Request, res: Response): Promise<void> => {
@@ -517,3 +506,4 @@ const _stub = {} as any;
 export const app = createApp(_stub);
 
 // Server is now started from the main index.ts entry point
+
