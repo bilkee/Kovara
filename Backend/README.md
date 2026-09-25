@@ -2,6 +2,10 @@
 
 Event indexer for the Kovara Social contract on Stellar. Processes on-chain events and maintains a queryable database for the frontend.
 
+> **Verified reference docs.** See [`docs/backend/`](../docs/backend/README.md) for
+> the architecture, REST API contracts, and operational runbook derived from the
+> code. When this README and those pages disagree, the code is the source of truth.
+
 ## Architecture
 
 The indexer listens to Stellar contract events and processes them into a PostgreSQL database:
@@ -615,3 +619,4 @@ See [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
 ## License
 
 MIT
+
