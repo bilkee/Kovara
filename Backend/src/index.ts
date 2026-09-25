@@ -17,6 +17,13 @@
  *   POLL_INTERVAL_MS       - (optional) Event streaming polling interval in ms, default 5000
  *   RATE_LIMIT_WINDOW_MS   - (optional) Rate limit window in ms, default 60000 (1 minute)
  *   RATE_LIMIT_MAX         - (optional) Max requests per IP per rate limit window, default 100
+ *
+ * Event-processing reliability (#648, #649, #650) and daily aggregation (#651) —
+ * all optional; the defaults are the ones documented in `retry.ts`,
+ * `dead-letter.ts` and `aggregation/job.ts`:
+ *   MAX_HANDLER_RETRIES     - (optional) Handler attempts before a failure is dead-lettered, default 3
+ *   AGGREGATION_INTERVAL_MS - (optional) Daily aggregation tick interval in ms, default 3600000 (1 hour)
+ *   AGGREGATION_CATCH_UP_DAYS - (optional) How many days back to catch up, default 7
  *   ENABLE_AUTH_MIDDLEWARE - (optional) Enable authentication middleware (default: false)
  *   ENABLE_RATE_LIMITING   - (optional) Enable rate limiting middleware (default: true)
  *   ENABLE_EXPERIMENTAL_ROUTES - (optional) Enable experimental routes (e.g., pools) (default: false)
@@ -41,6 +48,13 @@ import { runMigrations } from "./migrate";
 import { PostgresDatabase } from "./db";
 import { EventStore } from "./event-store";
 import { withRetry } from "./retry";
+import { buildIdempotencyKey } from "./idempotency";
+import { DeadLetterQueue } from "./dead-letter";
+import {
+  AggregationScheduler,
+  PostgresAggregationStore,
+  PostgresDeadLetterStore,
+} from "./aggregation";
 import { logger } from "./logger";
 import {
   alertManager,
@@ -148,33 +162,31 @@ async function ensureEventsTable(): Promise<void> {
     // BA-030: The events table tracks processing status (pending/processed/
     // failed/dead) with error details and timestamps so operators and replay
     // tooling can observe exactly how each event was handled.
+    //
+    // The column list must appear exactly once. A previous revision declared
+    // `id`…`status` twice, which made every one of these statements fail with
+    // a duplicate-column error; the surrounding catch turned that into a
+    // "schema drift" warning at every startup, and the events table was never
+    // actually created. `idempotency_key` is the #648 derived key, which lets
+    // a duplicate ledger event be recognised without re-reading the payload.
     await pgPool.query(`
       CREATE TABLE IF NOT EXISTS events (
-        id            BIGSERIAL   PRIMARY KEY,
-        event_id      TEXT        NOT NULL UNIQUE,
-        ledger        INTEGER     NOT NULL,
-        contract_id   TEXT        NOT NULL,
-        topic         TEXT[]      NOT NULL,
-        value         TEXT        NOT NULL,
-        tx_hash       TEXT        NOT NULL,
-        closed_at     TIMESTAMPTZ NOT NULL,
-        indexed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        status        TEXT        NOT NULL DEFAULT 'new'
-        id                BIGSERIAL   PRIMARY KEY,
-        event_id          TEXT        NOT NULL UNIQUE,
-        ledger            INTEGER     NOT NULL,
-        contract_id       TEXT        NOT NULL,
-        topic             TEXT[]      NOT NULL,
-        value             TEXT        NOT NULL,
-        tx_hash           TEXT        NOT NULL,
-        closed_at         TIMESTAMPTZ NOT NULL,
-        indexed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        status            TEXT        NOT NULL DEFAULT 'pending',
-        error             TEXT,
-        attempts          INTEGER     NOT NULL DEFAULT 0,
-        processed_at      TIMESTAMPTZ,
-        failed_at         TIMESTAMPTZ,
-        dead_lettered_at  TIMESTAMPTZ
+        id               BIGSERIAL   PRIMARY KEY,
+        event_id         TEXT        NOT NULL UNIQUE,
+        idempotency_key  TEXT,
+        ledger           INTEGER     NOT NULL,
+        contract_id      TEXT        NOT NULL,
+        topic            TEXT[]      NOT NULL,
+        value            TEXT        NOT NULL,
+        tx_hash          TEXT        NOT NULL,
+        closed_at        TIMESTAMPTZ NOT NULL,
+        indexed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        status           TEXT        NOT NULL DEFAULT 'pending',
+        error            TEXT,
+        attempts         INTEGER     NOT NULL DEFAULT 0,
+        processed_at     TIMESTAMPTZ,
+        failed_at        TIMESTAMPTZ,
+        dead_lettered_at TIMESTAMPTZ
       )
     `);
     // BA-033: Durable stream-state store used to persist the latest safe cursor
@@ -189,6 +201,12 @@ async function ensureEventsTable(): Promise<void> {
     await pgPool.query(`
       CREATE INDEX IF NOT EXISTS idx_events_ledger      ON events (ledger);
       CREATE INDEX IF NOT EXISTS idx_events_contract_id ON events (contract_id);
+    `);
+    // #648: Look up already-processed events by their derived key.
+    await pgPool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency_key
+      ON events (idempotency_key)
+      WHERE idempotency_key IS NOT NULL
     `);
   } catch (err) {
     // BE-28: Non-fatal — log and continue. If the events table is genuinely
@@ -235,18 +253,26 @@ async function ensurePostSearchIndex(): Promise<void> {
   }
 }
 
-async function persistEvent(event: RawEvent): Promise<void> {
-  await withRetry(
+async function persistEvent(event: RawEvent): Promise<boolean> {
+  // #648: Derive the stable key so a duplicate ledger event is recognised as
+  // the same event rather than persisted a second time. The unique index on
+  // `idempotency_key` (and on `event_id`) is what actually enforces this, so
+  // two replicas racing on the same event cannot both insert.
+  const idempotencyKey = buildIdempotencyKey(event.contractId, event.ledger, event.id);
+
+  const result = await withRetry(
     () =>
       pgPool.query(
         `
         INSERT INTO events
-          (event_id, ledger, contract_id, topic, value, tx_hash, closed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (event_id) DO NOTHING
+          (event_id, idempotency_key, ledger, contract_id, topic, value, tx_hash, closed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT DO NOTHING
+        RETURNING event_id
         `,
         [
           event.id,
+          idempotencyKey,
           event.ledger,
           event.contractId,
           event.topic,
@@ -259,23 +285,16 @@ async function persistEvent(event: RawEvent): Promise<void> {
       maxAttempts: 3,
       baseDelayMs: 300,
       backoffMultiplier: 2,
-      isRetryable: (err: unknown) => {
-        if (err instanceof Error) {
-          const msg = err.message.toLowerCase();
-          return (
-            msg.includes("connection") ||
-            msg.includes("timeout") ||
-            msg.includes("econnreset") ||
-            msg.includes("econnrefused") ||
-            msg.includes("socket hang up") ||
-            msg.includes("pool exhausted")
-          );
-        }
-        return false;
-      },
+      // #649: classifyFailure decides retryability, so a permanent failure
+      // (a constraint violation, a malformed closed_at) fails fast instead of
+      // burning the full backoff schedule.
       operationLabel: "persistEvent",
+      log: logger,
     }
   );
+
+  // No row returned means the event was already present — the duplicate case.
+  return (result.rowCount ?? 0) === 1;
 }
 
 // ── Recoverable event processing (BA-029) ───────────────────────────────────
@@ -299,13 +318,30 @@ async function persistEvent(event: RawEvent): Promise<void> {
 
 export type RawEventHandler = (event: RawEvent) => Promise<void>;
 
+/**
+ * Statuses an event may be claimed from.
+ *
+ * `new` and `pending` are both included because the schema has carried both
+ * spellings: `ensureEventsTable` defaults to `pending` while
+ * `007_events_processing_status.sql` defaults to `new`, and a database may have
+ * been created by either. Claiming from a single literal meant an event
+ * persisted under the other default could never be claimed, so its side effects
+ * silently never ran.
+ *
+ * `failed` is included so a dead-lettered or crashed event can be retried — that
+ * is what makes recovery work. `dead` is deliberately excluded: a
+ * dead-lettered event waits for an operator to requeue it, and re-claiming it
+ * on every restart would defeat the queue.
+ */
+const CLAIMABLE_STATUSES = ["new", "pending", "failed"] as const;
+
 /** Swap/select the event status atomically; returns whether the swap happened.
  *  Used to claim an event before processing so a single (or concurrent)
  *  reprocessor does not duplicate side effects. */
-async function claimEvent(eventId: string, from: string): Promise<boolean> {
+async function claimEvent(eventId: string): Promise<boolean> {
   const result = await pgPool.query(
-    `UPDATE events SET status = 'processing' WHERE event_id = $1 AND status = $2`,
-    [eventId, from]
+    `UPDATE events SET status = 'processing' WHERE event_id = $1 AND status = ANY($2::text[])`,
+    [eventId, [...CLAIMABLE_STATUSES]]
   );
   return (result.rowCount ?? 0) === 1;
 }
@@ -322,14 +358,22 @@ export async function markEventFailed(eventId: string): Promise<void> {
  *  event is never left present-but-unprocessed. Returns true if the event was
  *  newly claimed (i.e. its side effects actually ran). */
 export async function processEvent(event: RawEvent, handler: RawEventHandler): Promise<boolean> {
+  // #648: the insert is idempotent on the derived key, so a duplicate ledger
+  // event does not create a second row. The insert result is deliberately not
+  // used to short-circuit: an event that was persisted but whose handler never
+  // ran must still be claimed and processed below.
   await persistEvent(event);
-  // Claim the event (from 'new') before dispatching so the same event is not
-  // processed twice by a concurrent/restarted worker. If it was already claimed
-  // or processed, we treat it as done.
-  if (!(await claimEvent(event.id, "new"))) return false;
+
+  // Claim before dispatching so the same event is not processed twice by a
+  // concurrent or restarted worker. If it was already claimed or processed we
+  // treat it as done.
+  if (!(await claimEvent(event.id))) return false;
+
   try {
     await handler(event);
   } catch (err) {
+    // #650: retain the failure on the row so it is visible to operators, and
+    // rethrow so the caller (the stream) can decide whether to dead-letter.
     await markEventFailed(event.id);
     throw err;
   }
@@ -341,8 +385,11 @@ export async function processEvent(event: RawEvent, handler: RawEventHandler): P
  *  processed — this is what makes crash recovery and restart-based replay safe.
  *  Returns the number of events (re)processed. */
 export async function recoverPendingEvents(handler: RawEventHandler): Promise<number> {
+  // Only the claimable statuses. Selecting `status <> 'processed'` would also
+  // pull in `dead` events, which are meant to wait for an operator requeue.
   const result = await pgPool.query(
-    `SELECT * FROM events WHERE status <> 'processed' ORDER BY ledger ASC, id ASC`
+    `SELECT * FROM events WHERE status = ANY($1::text[]) ORDER BY ledger ASC, id ASC`,
+    [[...CLAIMABLE_STATUSES]]
   );
   let recovered = 0;
   for (const row of result.rows) {
@@ -594,6 +641,30 @@ async function main(): Promise<void> {
   const db = new PostgresDatabase(pgPool);
   const tracked = trackProcessing(eventStore);
 
+  // #650: Durable dead-letter queue. An event whose failures are permanent, or
+  // that has exhausted its retry budget, lands here with its full payload
+  // instead of being only logged. Operators inspect and requeue from this table.
+  const deadLetterQueue = new DeadLetterQueue(
+    new PostgresDeadLetterStore(pgPool),
+    parseEnvNumber("MAX_HANDLER_RETRIES", 3)
+  );
+
+  // #651: Daily price-index aggregation. The scheduler catches up any
+  // outstanding day on its first tick, so a window missed while the process was
+  // down is filled rather than silently skipped.
+  const aggregationScheduler = new AggregationScheduler(new PostgresAggregationStore(pgPool), {
+    intervalMs: parseEnvNumber("AGGREGATION_INTERVAL_MS", 3_600_000),
+    catchUpDays: parseEnvNumber("AGGREGATION_CATCH_UP_DAYS", 7),
+    log: logger,
+  });
+
+  // Recover any event persisted but not fully processed by a previous run
+  // before the live stream starts, so recovery does not race the new stream.
+  const recoveredAtStartup = await recoverPendingEvents((e) => handleEvent(e, db));
+  if (recoveredAtStartup > 0) {
+    logger.info("event_recovery_completed", { reprocessed: recoveredAtStartup });
+  }
+
   // BA-005: Start the real event stream unconditionally (no STUB MODE).
   logger.info("stream_start", { rpcUrl: STELLAR_RPC_URL, contractId: CONTRACT_ID, startLedger: START_LEDGER, pollIntervalMs: POLL_INTERVAL_MS });
   streamEvents(
@@ -603,12 +674,18 @@ async function main(): Promise<void> {
       startLedger: START_LEDGER,
       pollIntervalMs: POLL_INTERVAL_MS,
       store: eventStore,
+      deadLetterQueue,
       ...(FILTER_EVENTS ? { eventTypeFilter: FILTER_EVENTS } : {}),
     },
     (event) => processEvent(event, (e) => handleEvent(e, db)),
     abortController.signal,
   ).catch((err) => {
     logger.error("stream_fatal", { err });
+  });
+
+  aggregationScheduler.start();
+  logger.info("aggregation_scheduled", {
+    intervalMs: parseEnvNumber("AGGREGATION_INTERVAL_MS", 3_600_000),
   });
 
 // Create and start API server
@@ -636,6 +713,9 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info("shutdown_initiated", { signal });
     abortController.abort();
+    // #651: stop the timer before closing the pool, so a tick cannot start a
+    // query against a pool that is already closing.
+    aggregationScheduler.stop();
     server.close(async () => {
       await pgPool.end().catch(() => {});
       logger.info("shutdown_complete", { signal });
