@@ -36,6 +36,7 @@
 import { randomUUID } from "crypto";
 import { redact, redactValue, setErrorHook } from "./logger";
 import type { LoggerBindings } from "./logger";
+import { outboundRequestHeaders } from "./request-context";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -235,6 +236,19 @@ export function fingerprintFor(
 
 // ── Sinks ────────────────────────────────────────────────────────────────────
 
+/**
+ * #684: The request id the originating failure was logged under, if any.
+ *
+ * `installLoggerAlerting` folds the logger bindings into the alert context, so
+ * an alert raised while handling an HTTP request carries its request id and can
+ * forward it to the sink. Failures with no request (streaming, boot) simply
+ * have no id to propagate.
+ */
+function requestIdFromContext(event: AlertEvent): string | undefined {
+  const candidate = event.context?.correlationId ?? event.context?.requestId;
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined;
+}
+
 /** Minimal shape of a Sentry DSN we depend on. */
 export interface SentryDsn {
   publicKey: string;
@@ -332,10 +346,13 @@ export class SentrySink implements AlertSink {
 
     const response = await this.fetchImpl(this.endpoint, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Sentry-Auth": `Sentry sentry_version=7, sentry_client=kovara-indexer/1.0, sentry_key=${this.dsn.publicKey}`,
-      },
+      headers: outboundRequestHeaders(
+        {
+          "Content-Type": "application/json",
+          "X-Sentry-Auth": `Sentry sentry_version=7, sentry_client=kovara-indexer/1.0, sentry_key=${this.dsn.publicKey}`,
+        },
+        requestIdFromContext(event)
+      ),
       body: JSON.stringify(payload),
     });
 
@@ -377,7 +394,10 @@ export class WebhookSink implements AlertSink {
   async send(event: AlertEvent): Promise<void> {
     const response = await this.fetchImpl(this.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: outboundRequestHeaders(
+        { "Content-Type": "application/json" },
+        requestIdFromContext(event)
+      ),
       body: JSON.stringify({
         text: `[${event.severity}] ${event.message}`,
         event,
@@ -730,3 +750,4 @@ export function recordingFetch(
     return { ok: true, status: 200 };
   };
 }
+

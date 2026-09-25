@@ -2,11 +2,11 @@ import "express-async-errors";
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import rateLimit, { RateLimitRequestHandler } from "express-rate-limit";
-import crypto from "crypto";
 import { Database } from "../db";
 import { ApiErrorResponse, DebugSnapshot } from "./contracts";
 import { sendError, sendNotFound } from "./response";
 import { logger } from "../logger";
+import { requestIdMiddleware } from "../request-context";
 import pkg from "../../package.json";
 import {
   addressRateLimiter,
@@ -73,6 +73,16 @@ import { createProfilesRouter } from "./routes/profiles";
 import { createPostsRouter } from "./routes/posts";
 import { createFollowsRouter } from "./routes/follows";
 import { createPoolsRouter } from "./routes/pools";
+import { createSubmissionsRouter } from "./routes/submissions";
+import { createRewardsRouter } from "../rewards/routes";
+import { RewardStore } from "../rewards/store";
+import { createAuditRouter } from "../audit/routes";
+import { AuditStore } from "../audit/store";
+import { PostgresSubmissionFeed } from "../submissions/feed";
+import { createIndexRouter } from "../analytics/routes";
+import { PostgresAnalyticsStore } from "../analytics/store";
+import { createModerationRouter } from "./routes/moderation";
+import { ModerationStore } from "../verification/moderation";
 
 // ── Auth middleware (BE-25) ───────────────────────────────────────────────────
 
@@ -131,6 +141,37 @@ export interface AppOptions {
    * endpoint, so the endpoint reports live state rather than an empty set.
    */
   abuseDetector?: AbuseDetector;
+
+  /**
+   * #657: reward status, claim history, and the claim endpoint.
+   *
+   * Supplied by the caller rather than built from `db`, because these stores
+   * need a `pg.Pool` and issue transactional SQL that the `Database`
+   * repository interface has no reason to expose. When a store is omitted its
+   * routes are simply not mounted, so existing deployments and tests are
+   * unaffected.
+   */
+  rewardStore?: RewardStore;
+
+  /**
+   * #658: audit log reads plus whole-stream chain verification.
+   */
+  auditStore?: AuditStore;
+
+  /**
+   * #659: the paginated, filtered submission feed.
+   */
+  submissionFeed?: PostgresSubmissionFeed;
+   * #654/#655: Analytics store backing the historical index series, the country
+   * leaderboard, and the filter-decision log.
+   *
+   * Supplied by the caller rather than constructed from `db` because these
+   * endpoints issue analytical SQL (windowing, ranking, partial indexes) that the
+   * `Database` repository interface has no reason to expose. When it is
+   * omitted, `/index` is not mounted and every other route behaves exactly as
+   * before, so existing deployments and tests need no change.
+   */
+  analyticsStore?: PostgresAnalyticsStore;
 }
 
 // ── Runtime configuration (all values are env-overridable) ─────────────────
@@ -190,16 +231,6 @@ export function isDatabaseError(err: unknown): boolean {
   return false;
 }
 
-// ── Request correlation ID ─────────────────────────────────────────────────
-
-declare global {
-  namespace Express {
-    interface Request {
-      correlationId?: string;
-    }
-  }
-}
-
 // ── App factory ───────────────────────────────────────────────────────────────
 
 export function createApp(db: Database, options: AppOptions = {}): express.Application {
@@ -230,12 +261,11 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
     app.set("trust proxy", TRUST_PROXY);
   }
 
-  // ── Correlation ID middleware ────────────────────────────────────────────────
-  app.use((req: Request, _res: Response, next: NextFunction): void => {
-    const id = (req.headers["x-correlation-id"] as string) || crypto.randomUUID();
-    req.correlationId = id;
-    next();
-  });
+  // ── Request ID middleware (#684) ─────────────────────────────────────────────
+  // Resolves or generates the request id, exposes it to handlers and logs, and
+  // echoes it on every response — replacing the per-route X-Correlation-Id
+  // echoes that only covered a subset of routes.
+  app.use(requestIdMiddleware);
 
   // ── Health check (unlimited) ────────────────────────────────────────────────
   app.get("/health", async (_req: Request, res: Response): Promise<void> => {
@@ -342,10 +372,33 @@ export function createApp(db: Database, options: AppOptions = {}): express.Appli
       ...(found ? {} : { error: "no tracked identity matched", code: "IDENTITY_NOT_FOUND" }),
     });
   });
+  // Moderation / fraud review (issue #645). The store is created once per app so
+  // cases and their action logs survive across requests; a per-request store
+  // would make every case unreachable a moment after it was filed.
+  apiRouter.use("/moderation", createModerationRouter(new ModerationStore()));
 
 // Conditionally mount experimental routes
   if (process.env.EXPERIMENTAL_FEATURES === "true") {
     apiRouter.use("/pools", createPoolsRouter(db));
+  }
+
+  // #659: submission feed with pagination and status/user/date filters.
+  if (options.submissionFeed) {
+    apiRouter.use("/submissions", createSubmissionsRouter(options.submissionFeed));
+  }
+
+  // #657: reward status, claim history, and the claim endpoint.
+  if (options.rewardStore) {
+    apiRouter.use("/rewards", createRewardsRouter(options.rewardStore));
+  }
+
+  // #658: audit reads and chain verification.
+  if (options.auditStore) {
+    apiRouter.use("/audit", createAuditRouter(options.auditStore));
+  // #654/#655: historical index series, country leaderboards, and the filter
+  // decision log. Mounted only when a store is supplied — see AppOptions.
+  if (options.analyticsStore) {
+    apiRouter.use("/index", createIndexRouter(options.analyticsStore));
   }
 
   interface SearchQuery {
@@ -595,3 +648,4 @@ const _stub = {} as any;
 export const app = createApp(_stub);
 
 // Server is now started from the main index.ts entry point
+

@@ -2,6 +2,10 @@
 
 Event indexer for the Kovara Social contract on Stellar. Processes on-chain events and maintains a queryable database for the frontend.
 
+> **Verified reference docs.** See [`docs/backend/`](../docs/backend/README.md) for
+> the architecture, REST API contracts, and operational runbook derived from the
+> code. When this README and those pages disagree, the code is the source of truth.
+
 ## Architecture
 
 The indexer listens to Stellar contract events and processes them into a PostgreSQL database:
@@ -88,6 +92,87 @@ machine-readable `code` field:
 ```json
 { "error": "Profile not found", "code": "NOT_FOUND" }
 ```
+
+## Event-Processing Reliability
+
+A ledger event can legitimately be delivered more than once — `getEvents` pages
+overlap on a cursor replay, a restart resumes from a persisted cursor, an
+operator replays a range, or two replicas race during a handoff. These modules
+make each of those a no-op rather than a second write.
+
+| Module | Issue | Responsibility |
+| --- | --- | --- |
+| `src/idempotency.ts` | #648 | Derives, validates and parses the stable key for an event; `runOnce` executes a unit of work at most once per key. |
+| `src/retry.ts` | #649 | `classifyFailure` splits errors into transient/permanent; `withRetry` applies jittered exponential backoff to the transient ones only. |
+| `src/dead-letter.ts` | #650 | Counts attempts per event and dead-letters an unrecoverable failure with the full payload needed to debug and requeue it. |
+| `src/aggregation/` | #651 | Daily price-index aggregation, leased so a day is computed exactly once across replicas. |
+
+### Transient vs permanent
+
+Retrying a permanent failure (a malformed payload, a unique-constraint
+violation, a 4xx from the provider) burns the retry budget on work that can
+never succeed and delays the dead-letter signal. `classifyFailure` therefore
+checks, in order: an explicit `code` (SQLSTATE / syscall), then permanent
+message markers, then transient markers, and **defaults to permanent** — an
+error we do not understand cannot be fixed by repeating it, and the dead-letter
+path exists so a human can look at it.
+
+Backoff is exponential with **full jitter** (`random() * backoff`) rather than a
+fixed delay: when a dependency restarts every replica fails at the same instant,
+and a deterministic schedule would have them all retry in lockstep and reproduce
+the overload.
+
+### Idempotency keys
+
+Keys are **derived, never caller-supplied**:
+
+```
+kovara:event:v1:<contractId>:<ledger>:<eventId>
+```
+
+Deriving them means a caller cannot reuse a key across two different events
+(which would silently swallow the second). Uniqueness is enforced by the
+database — `events.idempotency_key` has a unique index, and `persistEvent`
+inserts with `ON CONFLICT DO NOTHING` — so two processes racing on the same
+event cannot both win.
+
+### Dead-letter queue
+
+An event that fails permanently, or that has exhausted its retry budget, is
+written to `event_dead_letters` with its topic, raw value, tx hash, ledger,
+error and attempt count, so it can be reproduced and fixed. The queue keeps the
+payload **unredacted** on purpose (log lines still redact payloads via
+`src/logger.ts`): a redacted queue is useless for debugging. Records are
+append-only; requeueing sets `requeued_at` rather than editing history.
+
+`dead` events are excluded from startup recovery — they wait for an operator to
+requeue them, and reclaiming them on every restart would defeat the queue.
+
+### Daily aggregation
+
+`AggregationScheduler` runs once an interval (default hourly) and aggregates the
+most recent day that is still outstanding, so a window missed while the process
+was down is caught up rather than skipped. Each run row in `aggregation_runs` is
+the lease: a day is computed exactly once across replicas, a failed day stays
+retryable, and the outcome is recorded either way.
+
+Every aggregate carries both `run_date` (the day summarised) and `computed_at`
+(when the job actually ran). They differ on a catch-up run, and conflating them
+would make a late-computed historical day indistinguishable from a fresh one.
+
+Prices are stored as `NUMERIC`, not `BIGINT`: the contract type is `i128`, and a
+BIGINT would overflow on any token with 7+ decimals scaled into the smallest
+unit, publishing a rounded — and wrong — cost-of-living index.
+
+### Environment variables
+
+All optional; the defaults are the ones documented in the modules above.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_HANDLER_RETRIES` | `3` | Handler attempts before a failure is dead-lettered |
+| `AGGREGATION_INTERVAL_MS` | `3600000` | Daily aggregation tick interval |
+| `AGGREGATION_CATCH_UP_DAYS` | `7` | How many days back to catch up |
 
 | HTTP Status | Code                | Description                     |
 |-------------|---------------------|---------------------------------|
@@ -755,6 +840,231 @@ docker run -p 3000:3000 --env-file .env Kovara-indexer
 kubectl apply -f k8s/deployment.yaml
 ```
 
+## Rewards, audit, and feeds (#656-#659)
+
+### Reward calculation (#656)
+
+`src/rewards/rules.ts` is pure. It reads the recorded submission and
+verification facts and returns integers — no clock, no randomness, no globals —
+so the same stored data always produces the same rewards. That is what makes a
+disputed payout arguable rather than mysterious.
+
+| Rule | Behaviour |
+| --- | --- |
+| Rejected submission | Pays nothing — not to the submitter, and not to the verifier who rejected it. Rejecting bad data is a cost the protocol bears, not a paid service. |
+| Pending submission | Pays nothing yet; verifier rewards are also withheld, because a pending submission can still be rejected. |
+| Verified submission | `base`, scaled by the corroboration multiplier, plus `verificationReward` to each deduplicated approving verifier. |
+| Flagged for review | The submitter's reward is **held** at `pendingReviewBps` and marked `pending`, not `claimable`. Held rather than clawed back, so a reversal never has to recover money already spent. |
+
+Corroboration is weighted `1/n^0.5` per submitter and capped, so agreement is
+rewarded but a colluding group cannot scale a payout without limit.
+
+**Duplicate votes are prevented twice.** In application code by
+`dedupeVerifications`, and in the database by `PRIMARY KEY (submission_id,
+verifier)` on `verifications` — so the rule holds even if a caller forgets to
+check. The *first* vote is the one that counts: a verifier who approves and then
+rejects is recorded as a duplicate rather than converting an approval into a
+rejection, because letting someone change their vote after seeing the reward
+would make the reward a function of when they looked.
+
+**Self-verification pays nothing.** An address cannot both create data and
+certify it.
+
+All amounts are `bigint`; multipliers are basis points applied with integer
+arithmetic, so the rules and the ledger cannot drift apart by a rounding step.
+
+### Claims (#657)
+
+`processing` is a real state, not a formality.
+
+- **No double-claim.** Accruals are claimed under `FOR UPDATE`, so two
+  concurrent claims of the same rows serialise and the second finds nothing
+  claimable. `idempotency_key` is `UNIQUE`, and that constraint — not the
+  application check — is what makes a concurrent retry resolve to one payout.
+- **A failed payout releases the accruals** back to `claimable`. A crash
+  mid-payout leaves the money `processing` and visible as such, rather than lost
+  or double-paid.
+- **A completed claim is never reversed.** The transfer already happened;
+  pretending otherwise would be a lie in the ledger.
+
+Balances are always derived by summing `reward_accruals`; no running total is
+stored, so a total and its underlying lines cannot disagree. An in-flight claim
+is reported separately from `claimed` so a payout in progress reads as in
+progress.
+
+```
+GET  /api/v1/rewards/:address
+GET  /api/v1/rewards/:address/claims?state=&limit=&offset=
+GET  /api/v1/rewards/:address/accruals?state=&limit=&offset=
+POST /api/v1/rewards/:address/claim      { "idempotency_key": "..." }
+```
+
+`idempotency_key` is **required** on claim. A client that times out mid-request
+cannot tell whether the payout landed, so a retry has to be safe by default —
+which means the key comes from the caller, not from the server. Reusing a key
+returns the original claim and moves no money.
+
+A claim with nothing claimable returns `200` with a zero-amount `processing`
+claim: that is a statement about the caller's balance, not a server fault.
+
+### Audit log (#658)
+
+An audit log that an operator with write access can quietly edit is not an audit
+log. Each entry hashes its own canonical content **and** the previous entry's
+hash:
+
+```
+hash(n) = SHA256(canonical(record n) || hash(n-1))
+```
+
+Altering or removing any record breaks verification for every record after it,
+and `GET /api/v1/audit/:stream/verify` reports the first break. The canonical
+form is fixed-order and length-prefixed, not `JSON.stringify` of an arbitrary
+object: field order is not guaranteed across versions, and without a length
+prefix `{a: "bc"}` and `{ab: "c"}` could hash identically.
+
+The chain is **per stream** (one per contract), so concurrent writers for
+different contracts do not serialise. Appends lock the stream's head row — the
+alternative, read-head-then-insert, lets two concurrent appends read the same
+head and silently fork the chain.
+
+> **Operational note.** The chain only means something if the application role
+> cannot `UPDATE` or `DELETE` `audit_log` in production. Revoke those grants
+> after setup:
+>
+> ```sql
+> REVOKE UPDATE, DELETE ON audit_log FROM <app_role>;
+> ```
+
+Audit writes never fail an event. A full audit table must not stall the indexer,
+so a write error is logged loudly and the event proceeds; a gap is detectable
+afterwards because the chain records where a record should have continued from.
+
+```
+GET /api/v1/audit?stream=&action=&outcome=&subject=&actor=&ledger=&from=&to=&limit=&offset=
+GET /api/v1/audit/:stream/verify
+```
+
+### Submission feed (#659)
+
+```
+GET /api/v1/submissions?status=&submitter=&country=&category=&from=&to=&limit=&offset=&summary=true
+GET /api/v1/submissions/:id
+```
+
+Filters combine with AND. An unrecognised `status` is a `400` rather than being
+ignored — silently returning everything because a client typo'd a filter is the
+failure most likely to go unnoticed, because the response is still a
+plausible-looking list. An empty feed is `200` with `total: 0`, not `404`.
+
+Ordering is `submitted_at DESC, id DESC`. The `id` tiebreak is what makes offset
+pagination consistent: without it, two rows sharing a timestamp can swap places
+between pages and a client sees a record twice or misses one. `has_more` is
+derived from the returned row count, so the final page reports `false` even when
+`total` is an exact multiple of the page size.
+
+`summary=true` returns a per-status breakdown. It deliberately ignores the
+`status` filter — a summary that could only ever report the one status that was
+filtered to would be useless.
+
+> Offset paging is the right choice for a stable snapshot, and the wrong one for
+> a continuously-written feed, where inserts during a walk shift the window. If
+> this feed needs to be tailed, add a keyset variant (`?after=<id>`) rather than
+> raising the offset cap.
+
+### Migration note
+
+`012_rewards_audit_submissions.sql` follows `010` (PR #773) and `011` (PR #774).
+The runner keys applied migrations by **filename prefix alone**, so each number
+is claimed by exactly one file. Note that `upstream/main` already has three
+`007_*.sql` and three `008_*.sql` files, so by that same rule only the first of
+each is ever applied — worth confirming those columns and indexes exist in your
+environment.
+## Index analytics (#652-#655)
+
+Daily price-index aggregation with robust statistics, plus the read endpoints
+that serve it.
+
+### How the index is computed
+
+`src/analytics/index-aggregation.ts` is pure and side-effect free. The pipeline,
+in order:
+
+1. **Status and absolute bounds** — rejected and (by default) pending
+   submissions are dropped, along with non-positive values and anything outside
+   an optional `minValue`/`maxValue`. These run first so a rejected submission
+   cannot influence the thresholds used to judge the others.
+2. **MAD filter** — rejects values beyond `madThreshold` (default 3)
+   median-absolute-deviations from the median. MAD is used rather than standard
+   deviation because it is built from the same robust centre and does not let
+   outliers inflate the measure meant to detect them.
+3. **Tukey IQR fence** — rejects values outside
+   `[Q1 - 1.5*IQR, Q3 + 1.5*IQR]`, catching skew a symmetric MAD window misses.
+4. **Per-submitter cap** — `maxSubmitterShare` bounds any one address's
+   influence, dropping their excess lowest-value-first.
+
+What survives is reduced to two values, kept deliberately separate:
+
+- **Median** — the published `median_value`. Up to half the sample can be
+  arbitrarily wrong before it moves at all.
+- **Credibility-weighted mean** — the published `weighted_value`. Weights are
+  `1 / n^0.5` per submitter, so corroboration counts but volume alone does not
+  decide the index.
+
+All arithmetic is integer (`bigint`). Prices are the contract's `i128` in the
+smallest fixed-point unit, and a median that rounds differently between two runs
+is not reproducible.
+
+### Why `maxValue` matters
+
+No statistical method can distinguish a legitimate extreme from a unit mistake
+— someone submitting rent in kobo rather than naira. That is a domain bound, so
+set it per deployment if your price range is known.
+
+### Reading the exclusion log
+
+Every excluded submission is recorded in `price_index_filter_decisions` with the
+reason and the threshold that produced it. This is what makes a disputed index
+value reviewable rather than merely arguable:
+
+```bash
+curl "localhost:3000/api/v1/index/NG/rent/decisions?date=2024-01-15"
+```
+
+### Endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/index/history` | Historical index values, newest first |
+| `GET /api/v1/index/leaderboard` | Countries ranked by index, or by contribution volume with `scope=contributors` |
+| `GET /api/v1/index/:country/:category/decisions` | Filter decisions behind a published value |
+
+Query parameters: `country`, `category`, `from`, `to`, `limit`, `offset`.
+`limit` is capped at 100; `offset` is unbounded, so deep pagination is available
+but should be used with the `has_more` flag rather than assumed.
+
+An empty result is a `200` with `total: 0`, not a `404` — a country with no
+submissions yet is a fact about the world, not a bad request.
+
+### Scheduling
+
+`runDailyIndexAggregation` runs at startup for the previous UTC day, and is
+idempotent: both tables are upserted, so a re-run converges on the same state
+rather than double-counting. Cross-replica runs are serialised with a Postgres
+advisory lock, which Postgres releases automatically if a replica dies mid-run.
+
+The job takes an optional `runDate` for backfill, and `maxPairs` to bound a
+catch-up run.
+
+### Migration note
+
+`011_price_index_analytics.sql` starts at `011`, not `010`, because
+`010_event_reliability.sql` claims `010` on the
+`feature/event-processing-reliability` branch. The runner keys applied
+migrations by filename prefix alone (`migrate.ts`), so two files sharing a
+prefix means one is silently skipped. **If you add a migration while both
+branches are open, pick a prefix not already claimed.**
+
 ## Troubleshooting
 
 ### Indexer falls behind
@@ -782,3 +1092,4 @@ See [CONTRIBUTING.md](../../CONTRIBUTING.md) for guidelines.
 ## License
 
 MIT
+

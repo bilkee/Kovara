@@ -25,10 +25,6 @@ export function createProfilesRouter(db: Database): Router {
   router.get(
     "/:address",
     async (req: Request, res: Response<ProfileResponse | ApiErrorResponse>): Promise<void> => {
-      if (req.correlationId) {
-        res.set("X-Correlation-Id", req.correlationId);
-      }
-
       const { address } = req.params;
 
       if (!address || typeof address !== "string" || address.trim() === "") {
