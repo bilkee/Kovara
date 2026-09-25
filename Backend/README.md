@@ -89,6 +89,87 @@ machine-readable `code` field:
 { "error": "Profile not found", "code": "NOT_FOUND" }
 ```
 
+## Event-Processing Reliability
+
+A ledger event can legitimately be delivered more than once — `getEvents` pages
+overlap on a cursor replay, a restart resumes from a persisted cursor, an
+operator replays a range, or two replicas race during a handoff. These modules
+make each of those a no-op rather than a second write.
+
+| Module | Issue | Responsibility |
+| --- | --- | --- |
+| `src/idempotency.ts` | #648 | Derives, validates and parses the stable key for an event; `runOnce` executes a unit of work at most once per key. |
+| `src/retry.ts` | #649 | `classifyFailure` splits errors into transient/permanent; `withRetry` applies jittered exponential backoff to the transient ones only. |
+| `src/dead-letter.ts` | #650 | Counts attempts per event and dead-letters an unrecoverable failure with the full payload needed to debug and requeue it. |
+| `src/aggregation/` | #651 | Daily price-index aggregation, leased so a day is computed exactly once across replicas. |
+
+### Transient vs permanent
+
+Retrying a permanent failure (a malformed payload, a unique-constraint
+violation, a 4xx from the provider) burns the retry budget on work that can
+never succeed and delays the dead-letter signal. `classifyFailure` therefore
+checks, in order: an explicit `code` (SQLSTATE / syscall), then permanent
+message markers, then transient markers, and **defaults to permanent** — an
+error we do not understand cannot be fixed by repeating it, and the dead-letter
+path exists so a human can look at it.
+
+Backoff is exponential with **full jitter** (`random() * backoff`) rather than a
+fixed delay: when a dependency restarts every replica fails at the same instant,
+and a deterministic schedule would have them all retry in lockstep and reproduce
+the overload.
+
+### Idempotency keys
+
+Keys are **derived, never caller-supplied**:
+
+```
+kovara:event:v1:<contractId>:<ledger>:<eventId>
+```
+
+Deriving them means a caller cannot reuse a key across two different events
+(which would silently swallow the second). Uniqueness is enforced by the
+database — `events.idempotency_key` has a unique index, and `persistEvent`
+inserts with `ON CONFLICT DO NOTHING` — so two processes racing on the same
+event cannot both win.
+
+### Dead-letter queue
+
+An event that fails permanently, or that has exhausted its retry budget, is
+written to `event_dead_letters` with its topic, raw value, tx hash, ledger,
+error and attempt count, so it can be reproduced and fixed. The queue keeps the
+payload **unredacted** on purpose (log lines still redact payloads via
+`src/logger.ts`): a redacted queue is useless for debugging. Records are
+append-only; requeueing sets `requeued_at` rather than editing history.
+
+`dead` events are excluded from startup recovery — they wait for an operator to
+requeue them, and reclaiming them on every restart would defeat the queue.
+
+### Daily aggregation
+
+`AggregationScheduler` runs once an interval (default hourly) and aggregates the
+most recent day that is still outstanding, so a window missed while the process
+was down is caught up rather than skipped. Each run row in `aggregation_runs` is
+the lease: a day is computed exactly once across replicas, a failed day stays
+retryable, and the outcome is recorded either way.
+
+Every aggregate carries both `run_date` (the day summarised) and `computed_at`
+(when the job actually ran). They differ on a catch-up run, and conflating them
+would make a late-computed historical day indistinguishable from a fresh one.
+
+Prices are stored as `NUMERIC`, not `BIGINT`: the contract type is `i128`, and a
+BIGINT would overflow on any token with 7+ decimals scaled into the smallest
+unit, publishing a rounded — and wrong — cost-of-living index.
+
+### Environment variables
+
+All optional; the defaults are the ones documented in the modules above.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MAX_HANDLER_RETRIES` | `3` | Handler attempts before a failure is dead-lettered |
+| `AGGREGATION_INTERVAL_MS` | `3600000` | Daily aggregation tick interval |
+| `AGGREGATION_CATCH_UP_DAYS` | `7` | How many days back to catch up |
+
 | HTTP Status | Code                | Description                     |
 |-------------|---------------------|---------------------------------|
 | 400         | `INVALID_QUERY`     | Invalid query parameters        |
